@@ -1,3 +1,4 @@
+/* eslint-disable func-style, camelcase */
 const cp = require('child_process')
 const fs = require('fs')
 const path = require('path')
@@ -17,6 +18,7 @@ const { mkdirRecursiveSync } = require('../../lib/fs')
 const { getSiteData, getAddons, getCurrentAddon } = require('../../utils/addons/prepare')
 const Command = require('../../utils/command')
 const { injectEnvVariables } = require('../../utils/dev')
+const ide = require('../../utils/ide/ide')
 const {
   // NETLIFYDEV,
   NETLIFYDEVLOG,
@@ -33,8 +35,8 @@ const templatesDir = path.resolve(__dirname, '../../functions-templates')
 class FunctionsCreateCommand extends Command {
   async run() {
     const { flags, args } = this.parse(FunctionsCreateCommand)
+    if (flags.ide_templates) ide_template_list()
     const functionsDir = await ensureFunctionDirExists(this)
-
     /* either download from URL or scaffold from template */
     const mainFunc = flags.url ? downloadFromURL : scaffoldFromTemplate
     await mainFunc(this, flags, args, functionsDir)
@@ -65,6 +67,8 @@ FunctionsCreateCommand.aliases = ['function:create']
 FunctionsCreateCommand.flags = {
   name: flagsLib.string({ char: 'n', description: 'function name' }),
   url: flagsLib.string({ char: 'u', description: 'pull template from URL' }),
+  ide_template: flagsLib.integer({ description: 'pick template (by index, from ide_list_templates)', hidden: true }),
+  ide_templates: flagsLib.boolean({ description: 'list local templates', hidden: true }),
   ...FunctionsCreateCommand.flags,
 }
 module.exports = FunctionsCreateCommand
@@ -86,18 +90,21 @@ const getNameFromArgs = async function (args, flags, defaultName) {
     return args.name
   }
 
-  const { name } = await inquirer.prompt([
-    {
-      name: 'name',
-      message: 'name your function: ',
-      default: defaultName,
-      type: 'input',
-      validate: (val) => Boolean(val) && /^[\w.-]+$/i.test(val),
-      // make sure it is not undefined and is a valid filename.
-      // this has some nuance i have ignored, eg crossenv and i18n concerns
-    },
-  ])
-  return name
+  if (!ide.isActive()) {
+    const { name } = await inquirer.prompt([
+      {
+        name: 'name',
+        message: 'name your function: ',
+        default: defaultName,
+        type: 'input',
+        validate: (val) => Boolean(val) && /^[\w.-]+$/i.test(val),
+        // make sure it is not undefined and is a valid filename.
+        // this has some nuance i have ignored, eg crossenv and i18n concerns
+      },
+    ])
+    return name
+  }
+  return await ide.input({ prompt: 'name your function' })
 }
 
 const filterRegistry = function (registry, input) {
@@ -117,26 +124,40 @@ const filterRegistry = function (registry, input) {
 }
 
 const formatRegistryArrayForInquirer = function (lang) {
+  return getRegistryArray(lang).map((t) => ({
+    // confusing but this is the format inquirer wants
+    name: `[${t.name}] ${t.description}`,
+    value: t,
+    short: `${lang}-${t.name}`,
+  }))
+}
+
+const formatRegistryArrayForIDE = function (lang) {
+  return getRegistryArray(lang).map((t) => ({
+    label: t.name,
+    detail: t.description,
+    value: t,
+    // short: `${lang}-${t.name}`,
+  }))
+}
+
+const getRegistryArray = function (lang) {
   const folderNames = fs.readdirSync(path.join(templatesDir, lang))
-  const registry = folderNames
-    // filter out markdown files
-    .filter((folderName) => !folderName.endsWith('.md'))
-    // eslint-disable-next-line node/global-require, import/no-dynamic-require
-    .map((folderName) => require(path.join(templatesDir, lang, folderName, '.netlify-function-template.js')))
-    .sort(
-      (folderNameA, folderNameB) =>
-        (folderNameA.priority || DEFAULT_PRIORITY) - (folderNameB.priority || DEFAULT_PRIORITY),
-    )
-    .map((t) => {
-      t.lang = lang
-      return {
-        // confusing but this is the format inquirer wants
-        name: `[${t.name}] ${t.description}`,
-        value: t,
-        short: `${lang}-${t.name}`,
-      }
-    })
-  return registry
+  return (
+    folderNames
+      // filter out markdown files
+      .filter((folderName) => !folderName.endsWith('.md'))
+      // eslint-disable-next-line node/global-require, import/no-dynamic-require
+      .map((folderName) => require(path.join(templatesDir, lang, folderName, '.netlify-function-template.js')))
+      .sort(
+        (folderNameA, folderNameB) =>
+          (folderNameA.priority || DEFAULT_PRIORITY) - (folderNameB.priority || DEFAULT_PRIORITY),
+      )
+      .map((t) => {
+        t.lang = lang
+        return t
+      })
+  )
 }
 
 // pick template from our existing templates
@@ -192,6 +213,25 @@ const pickTemplate = async function () {
     },
   })
   return chosentemplate
+}
+
+const pickTemplate_ide = async () => {
+  const items = [
+    { label: 'url', value: 'url' },
+    { label: 'report', value: 'report' },
+    ...formatRegistryArrayForIDE('js'),
+  ]
+  return (await ide.pick(items)).value
+}
+
+function ide_template_list() {
+  console.log()
+  console.log(JSON.stringify(getRegistryArray('js')))
+  console.log()
+  process.exit(0)
+}
+function ide_template_pick(flags) {
+  if (typeof flags.ide_template === 'number') return formatRegistryArrayForIDE('js')[flags.ide_template].value
 }
 
 const DEFAULT_PRIORITY = 999
@@ -319,8 +359,10 @@ const installDeps = function (functionPath) {
 
 // no --url flag specified, pick from a provided template
 const scaffoldFromTemplate = async function (context, flags, args, functionsDir) {
+  const tpl = ide_template_pick(flags)
   // pull the rest of the metadata from the template
-  const chosentemplate = await pickTemplate()
+  // const chosentemplate = await pickTemplate()
+  const chosentemplate = tpl || (await (ide.isActive() ? pickTemplate_ide() : pickTemplate()))
   if (chosentemplate === 'url') {
     const { chosenurl } = await inquirer.prompt([
       {
@@ -374,7 +416,9 @@ const scaffoldFromTemplate = async function (context, flags, args, functionsDir)
     fs.unlinkSync(path.join(functionPath, '.netlify-function-template.js'))
     // rename the root function file if it has a different name from default
     if (name !== templateName) {
-      fs.renameSync(path.join(functionPath, `${templateName}.js`), path.join(functionPath, `${name}.js`))
+      const newFilePath = path.join(functionPath, `${name}.js`)
+      fs.renameSync(path.join(functionPath, `${templateName}.js`), newFilePath)
+      ide.focusOnFile(newFilePath)
     }
     // npm install
     if (hasPackageJSON) {
@@ -382,7 +426,8 @@ const scaffoldFromTemplate = async function (context, flags, args, functionsDir)
         text: `installing dependencies for ${name}`,
         spinner: 'moon',
       }).start()
-      await installDeps(functionPath)
+      // await installDeps(functionPath)
+      await ide.withProgress(`installing dependencies for ${name}`, () => installDeps(functionPath))
       spinner.succeed(`installed dependencies for ${name}`)
     }
 
@@ -482,6 +527,7 @@ const installAddons = async function (context, functionAddons, fnPath) {
       await handleAddonDidInstall({ addonCreated, addonDidInstall, context, fnPath })
     } catch (error_) {
       error(`${NETLIFYDEVERR} Error installing addon: `, error_)
+      ide.error(`Error installing addon: ${error_}`)
     }
   })
   return Promise.all(arr)
@@ -489,11 +535,13 @@ const installAddons = async function (context, functionAddons, fnPath) {
 
 // we used to allow for a --dir command,
 // but have retired that to force every scaffolded function to be a directory
-const ensureFunctionPathIsOk = function (context, functionsDir, name) {
+const ensureFunctionPathIsOk = async function (context, functionsDir, name) {
   const functionPath = path.join(functionsDir, name)
   if (fs.existsSync(functionPath)) {
     context.log(`${NETLIFYDEVLOG} Function ${functionPath} already exists, cancelling...`)
+    await ide.warn(`Function ${functionPath} already exists, cancelling...`)
     process.exit(1)
   }
   return functionPath
 }
+/* eslint-enable func-style, camelcase */
